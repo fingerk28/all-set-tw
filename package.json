@@ -1,0 +1,60 @@
+{
+  "name": "all-set-tw",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "prebuild": "node scripts/prepare-cloudflare-build.mjs",
+    "build": "npm run build --workspaces",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "npm run typecheck --workspaces",
+    "test:unit": "npm run test:unit -w @taiwan-fin-hub/web",
+    "test:backend": "npm test -w @taiwan-fin-hub/worker && npm test -w @taiwan-fin-hub/db && npm run test:selfcheck -w @taiwan-fin-hub/connectors && npm run test:deploy",
+    "test:deploy": "node --test scripts/deploy-with-vapid.test.mjs scripts/cloudflare-access.test.mjs scripts/sync-upstream.test.mjs",
+    "test:e2e": "npm run test:e2e -w @taiwan-fin-hub/web",
+    "verify:web": "npm run typecheck -w @taiwan-fin-hub/web && npm run test:unit -w @taiwan-fin-hub/web && npm run test:e2e -w @taiwan-fin-hub/web && npm run build -w @taiwan-fin-hub/web",
+    "dev": "npm run dev -w @taiwan-fin-hub/worker",
+    "deploy": "npm run db:migrate:remote && XDG_CONFIG_HOME=.wrangler-config node scripts/deploy-with-vapid.mjs",
+    "db:migrate:local": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --remote",
+    "db:schema:docs": "node scripts/generate-database-schema.mjs"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CONFIG_ENCRYPTION_KEY": {
+        "description": "用於加密儲存在 D1 的連接器憑證。**請務必修改預設值**，可使用 `openssl rand -hex 32` 產生隨機字串；部署後若更換此金鑰，現有連接器設定將無法解密。"
+      },
+      "TEAM_DOMAIN": {
+        "description": "Cloudflare GUI 部署流程會自動取得並設定。手動設定時填入 `https://yourteam.cloudflareaccess.com`，不包含 `/cdn-cgi/access/certs`。"
+      },
+      "POLICY_AUD": {
+        "description": "Cloudflare GUI 部署流程會自動取得並設定保護此 Worker 的 Access Application Audience (AUD) Tag。手動設定時可從 Access Application → Configure → Additional settings → AUD tag 複製。"
+      },
+      "DB": {
+        "description": "儲存連接器設定、同步金融資料及資料庫遷移紀錄的 D1 資料庫。"
+      },
+      "BROWSER": {
+        "description": "Cloudflare Browser Rendering binding，供需要瀏覽器的連接器（如玉山銀行、國泰世華銀行、永豐銀行、台新銀行）使用。"
+      },
+      "AI": {
+        "description": "Cloudflare Workers AI binding，供 Gemma 4 辨識銀行登入驗證碼。"
+      },
+      "SYNC_QUEUE": {
+        "description": "串接排程同步工作；每個 connector 由獨立的 Queue consumer invocation 執行。"
+      }
+    }
+  },
+  "devDependencies": {
+    "@typescript/native": "npm:typescript@~7.0.2",
+    "esbuild": "^0.28.1",
+    "prettier": "^3.9.5",
+    "prettier-plugin-svelte": "^4.1.1",
+    "typescript": "~6.0.3",
+    "vite": "^8.1.4"
+  }
+}

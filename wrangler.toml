@@ -1,0 +1,39 @@
+name = "all-set-tw"
+main = "apps/worker/src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+workers_dev = true
+preview_urls = false
+
+assets = { directory = "apps/web/dist", binding = "ASSETS" }
+browser = { binding = "BROWSER" }
+ai = { binding = "AI" }
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[queues.producers]]
+binding = "SYNC_QUEUE"
+queue = "taiwan-fin-hub-sync"
+
+[[queues.consumers]]
+queue = "taiwan-fin-hub-sync"
+max_batch_size = 1
+max_batch_timeout = 1
+max_concurrency = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taiwan-fin-hub"
+# database_id is intentionally omitted from this public configuration.
+# Cloudflare automatically provisions or resolves the D1 binding on deploy.
+migrations_dir = "packages/db/migrations"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+invocation_logs = true

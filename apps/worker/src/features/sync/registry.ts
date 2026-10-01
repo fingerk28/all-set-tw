@@ -1,0 +1,168 @@
+import { connectorCatalog, type ConnectorId } from "@taiwan-fin-hub/core";
+import type { SyncTrigger } from "@taiwan-fin-hub/db";
+import type { Env } from "../../platform/env";
+import {
+  prepareSinopacCaptchaSession,
+  prepareHncbCaptchaSession,
+  prepareKgibankCaptchaSession,
+  prepareRakutenCaptchaSession,
+  prepareTaishinCaptchaSession,
+  prepareObankCaptchaSession,
+  prepareFirstbankCaptchaSession,
+  prepareMegabankCaptchaSession,
+  syncCathaybk,
+  syncCtbc,
+  syncSkbank,
+  syncEsun,
+  syncSinopac,
+  syncObank,
+  syncNextbank,
+  prepareNextbankCaptchaSession,
+  syncFirstbank,
+  syncHncb,
+  syncKgibank,
+  syncRakuten,
+  syncTaishin,
+  syncTdcc,
+  syncMegabank,
+  SYNC_SCOPE_ALL,
+  TDCC_SCOPE_BANK,
+  TDCC_SCOPE_INVESTMENTS,
+  TDCC_SCOPE_TRADES,
+  type SinopacSyncOverrides,
+  type ObankSyncOverrides,
+  type FirstbankSyncOverrides,
+  type SyncOutcome,
+  type SyncScope,
+  type HncbSyncOverrides,
+  type KgibankSyncOverrides,
+  type RakutenSyncOverrides,
+  type TaishinSyncOverrides,
+  type TdccSyncOverrides,
+  type CathaySyncOverrides,
+  type MegabankSyncOverrides,
+} from "./service";
+
+type ConnectorRuntimeDefinition = {
+  run: (
+    env: Env,
+    trigger: SyncTrigger,
+    scope: SyncScope,
+    overrides: Record<string, unknown>,
+  ) => Promise<SyncOutcome>;
+  prepareChallenge?: (env: Env) => Promise<unknown>;
+};
+
+export const connectorRuntimeRegistry: Record<
+  ConnectorId,
+  ConnectorRuntimeDefinition
+> = {
+  einvoice: {
+    run: async () => {
+      throw new Error(
+        "Electronic invoice sync must be started through its durable Queue flow.",
+      );
+    },
+  },
+  tdcc: {
+    run: (env, trigger, scope, overrides) =>
+      syncTdcc(
+        env,
+        trigger,
+        overrides as TdccSyncOverrides,
+        scope === SYNC_SCOPE_ALL ? tdccAllScopes() : [scope],
+      ),
+  },
+  esun: {
+    run: (env, trigger) => syncEsun(env, trigger),
+  },
+  cathaybk: {
+    run: (env, trigger, _scope, overrides) =>
+      syncCathaybk(env, trigger, overrides as CathaySyncOverrides),
+  },
+  ctbc: {
+    run: (env, trigger) => syncCtbc(env, trigger),
+  },
+  skbank: {
+    run: (env, trigger) => syncSkbank(env, trigger),
+  },
+  sinopac: {
+    run: (env, trigger, _scope, overrides) =>
+      syncSinopac(env, trigger, overrides as SinopacSyncOverrides),
+    prepareChallenge: prepareSinopacCaptchaSession,
+  },
+  taishin: {
+    run: (env, trigger, _scope, overrides) =>
+      syncTaishin(env, trigger, overrides as TaishinSyncOverrides),
+    prepareChallenge: prepareTaishinCaptchaSession,
+  },
+  hncb: {
+    run: (env, trigger, _scope, overrides) =>
+      syncHncb(env, trigger, overrides as HncbSyncOverrides),
+    prepareChallenge: prepareHncbCaptchaSession,
+  },
+  obank: {
+    run: (env, trigger, _scope, overrides) =>
+      syncObank(env, trigger, overrides as ObankSyncOverrides),
+    prepareChallenge: prepareObankCaptchaSession,
+  },
+  nextbank: {
+    run: (env, trigger, _scope, overrides) =>
+      syncNextbank(env, trigger, overrides),
+    prepareChallenge: prepareNextbankCaptchaSession,
+  },
+  firstbank: {
+    run: (env, trigger, _scope, overrides) =>
+      syncFirstbank(env, trigger, overrides as FirstbankSyncOverrides),
+    prepareChallenge: prepareFirstbankCaptchaSession,
+  },
+  rakuten: {
+    run: (env, trigger, _scope, overrides) =>
+      syncRakuten(env, trigger, overrides as RakutenSyncOverrides),
+    prepareChallenge: prepareRakutenCaptchaSession,
+  },
+  kgibank: {
+    run: (env, trigger, _scope, overrides) =>
+      syncKgibank(env, trigger, overrides as KgibankSyncOverrides),
+    prepareChallenge: prepareKgibankCaptchaSession,
+  },
+  megabank: {
+    run: (env, trigger, _scope, overrides) =>
+      syncMegabank(env, trigger, overrides as MegabankSyncOverrides),
+    prepareChallenge: prepareMegabankCaptchaSession,
+  },
+};
+
+export function runConnectorSync(
+  env: Env,
+  connectorId: ConnectorId,
+  trigger: SyncTrigger,
+  scope: SyncScope = SYNC_SCOPE_ALL,
+  overrides: Record<string, unknown> = {},
+) {
+  const supportedScopes: readonly string[] =
+    connectorCatalog[connectorId].scopes;
+  if (!supportedScopes.includes(scope)) {
+    throw new Error(`${connectorId} sync scope is not supported: ${scope}`);
+  }
+  return connectorRuntimeRegistry[connectorId].run(
+    env,
+    trigger,
+    scope,
+    overrides,
+  );
+}
+
+export function prepareConnectorChallenge(env: Env, connectorId: ConnectorId) {
+  const prepare = connectorRuntimeRegistry[connectorId].prepareChallenge;
+  if (!prepare) {
+    throw new Error(
+      `${connectorId} does not support an interactive challenge.`,
+    );
+  }
+  return prepare(env);
+}
+
+function tdccAllScopes(): SyncScope[] {
+  return [TDCC_SCOPE_INVESTMENTS, TDCC_SCOPE_BANK, TDCC_SCOPE_TRADES];
+}

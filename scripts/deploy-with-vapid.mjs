@@ -1,0 +1,527 @@
+import { createECDH } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { parseEnv } from "node:util";
+import { prepareAccessSetup } from "./cloudflare-access.mjs";
+
+const scriptPath = fileURLToPath(import.meta.url);
+const scriptDirectory = dirname(scriptPath);
+const repositoryDirectory = resolve(scriptDirectory, "..");
+const invocationDirectory = process.cwd();
+const wranglerScript = join(
+  repositoryDirectory,
+  "node_modules",
+  "wrangler",
+  "bin",
+  "wrangler.js",
+);
+
+const deployArguments = process.argv.slice(2);
+const requiredQueueNames = ["taiwan-fin-hub-sync"];
+
+function optionArguments(argumentsToInspect, optionNames) {
+  const selected = [];
+
+  for (let index = 0; index < argumentsToInspect.length; index += 1) {
+    const argument = argumentsToInspect[index];
+    const matchingName = optionNames.find(
+      (optionName) =>
+        argument === optionName || argument.startsWith(`${optionName}=`),
+    );
+
+    if (!matchingName) continue;
+
+    selected.push(argument);
+    if (argument === matchingName && argumentsToInspect[index + 1]) {
+      selected.push(argumentsToInspect[index + 1]);
+      index += 1;
+    }
+  }
+
+  return selected;
+}
+
+function booleanOptionEnabled(argumentsToInspect, optionName) {
+  return argumentsToInspect.some(
+    (argument) => argument === optionName || argument === `${optionName}=true`,
+  );
+}
+
+function removeSingleOption(argumentsToInspect, optionName) {
+  const remaining = [];
+  const values = [];
+
+  for (let index = 0; index < argumentsToInspect.length; index += 1) {
+    const argument = argumentsToInspect[index];
+
+    if (argument === optionName) {
+      const value = argumentsToInspect[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error(`${optionName} requires a file path.`);
+      }
+      values.push(value);
+      index += 1;
+      continue;
+    }
+
+    if (argument.startsWith(`${optionName}=`)) {
+      const value = argument.slice(optionName.length + 1);
+      if (!value) throw new Error(`${optionName} requires a file path.`);
+      values.push(value);
+      continue;
+    }
+
+    remaining.push(argument);
+  }
+
+  if (values.length > 1) {
+    throw new Error(`${optionName} can only be provided once.`);
+  }
+
+  return { remaining, value: values[0] ?? null };
+}
+
+function runWrangler(argumentsToRun, options = {}) {
+  const { captureOutput = false } = options;
+  const child = spawn(process.execPath, [wranglerScript, ...argumentsToRun], {
+    cwd: invocationDirectory,
+    env: {
+      ...process.env,
+      XDG_CONFIG_HOME:
+        process.env.XDG_CONFIG_HOME ??
+        join(invocationDirectory, ".wrangler-config"),
+    },
+    stdio: captureOutput ? ["ignore", "pipe", "pipe"] : "inherit",
+    windowsHide: true,
+  });
+
+  if (!captureOutput) {
+    return new Promise((resolvePromise, rejectPromise) => {
+      child.once("error", rejectPromise);
+      child.once("close", (exitCode) => resolvePromise({ exitCode }));
+    });
+  }
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", rejectPromise);
+    child.once("close", (exitCode) =>
+      resolvePromise({ exitCode, stdout, stderr }),
+    );
+  });
+}
+
+function generateVapidKeys() {
+  const curve = createECDH("prime256v1");
+  curve.generateKeys();
+
+  let publicKey = curve.getPublicKey();
+  let privateKey = curve.getPrivateKey();
+
+  // Keep the exact fixed-width representation expected by web-push.
+  if (privateKey.length < 32) {
+    privateKey = Buffer.concat([
+      Buffer.alloc(32 - privateKey.length),
+      privateKey,
+    ]);
+  }
+  if (publicKey.length < 65) {
+    publicKey = Buffer.concat([Buffer.alloc(65 - publicKey.length), publicKey]);
+  }
+
+  return {
+    publicKey: publicKey.toString("base64url"),
+    privateKey: privateKey.toString("base64url"),
+  };
+}
+
+function isMissingWorkerResult(result) {
+  const output = `${result.stdout}\n${result.stderr}`;
+  return (
+    result.exitCode !== 0 &&
+    /worker .* not found|if this is a new worker, run .*wrangler deploy/i.test(
+      output,
+    )
+  );
+}
+
+function queueContextArguments(argumentsToDeploy = deployArguments) {
+  return optionArguments(argumentsToDeploy, [
+    "--cwd",
+    "--config",
+    "-c",
+    "--env",
+    "-e",
+    "--env-file",
+  ]);
+}
+
+function isMissingQueueResult(result, queueName) {
+  const output = `${result.stdout}\n${result.stderr}`;
+  return (
+    result.exitCode !== 0 &&
+    output.includes(`Queue "${queueName}" does not exist`)
+  );
+}
+
+export async function ensureQueueExists(
+  queueName,
+  contextArguments,
+  run = runWrangler,
+) {
+  const inspect = () =>
+    run(["queues", "info", queueName, ...contextArguments], {
+      captureOutput: true,
+    });
+  const existing = await inspect();
+  if (existing.exitCode === 0) {
+    console.log(`[deploy] Queue '${queueName}' already exists.`);
+    return;
+  }
+  if (!isMissingQueueResult(existing, queueName)) {
+    throw new Error(
+      `Unable to inspect Queue '${queueName}' before deployment.\n${existing.stderr.trim()}`,
+    );
+  }
+
+  console.log(`[deploy] Queue '${queueName}' was not found; creating it.`);
+  const creation = await run(
+    ["queues", "create", queueName, ...contextArguments],
+    { captureOutput: true },
+  );
+  if (creation.exitCode === 0) {
+    console.log(`[deploy] Created Queue '${queueName}'.`);
+    return;
+  }
+
+  // Another concurrent build may have created the shared Queue after our
+  // initial check. Confirm the final state before treating creation as failed.
+  const afterCreation = await inspect();
+  if (afterCreation.exitCode === 0) {
+    console.log(`[deploy] Queue '${queueName}' is now available.`);
+    return;
+  }
+
+  throw new Error(
+    `Unable to create Queue '${queueName}' before deployment.\n${creation.stderr.trim()}`,
+  );
+}
+
+export async function ensureRequiredQueues(
+  contextArguments = queueContextArguments(),
+  run = runWrangler,
+) {
+  for (const queueName of requiredQueueNames) {
+    await ensureQueueExists(queueName, contextArguments, run);
+  }
+}
+
+async function existingSecretNames(argumentsToDeploy, run, environment) {
+  const guiWorkerName = environment.WRANGLER_CI_OVERRIDE_NAME;
+  // secret list does not apply the Builds name override. With --name, --env
+  // would append a suffix to the GUI's already complete Worker name.
+  const contextArguments = optionArguments(argumentsToDeploy, [
+    "--cwd",
+    "--config",
+    "-c",
+    ...(guiWorkerName ? [] : ["--env", "-e"]),
+    "--env-file",
+    ...(guiWorkerName ? [] : ["--name"]),
+  ]);
+  if (guiWorkerName) contextArguments.push("--name", guiWorkerName);
+  const result = await run(
+    ["secret", "list", "--format", "json", ...contextArguments],
+    { captureOutput: true },
+  );
+
+  if (isMissingWorkerResult(result)) {
+    return null;
+  }
+
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `Unable to inspect Worker secrets before deployment.\n${result.stderr.trim()}`,
+    );
+  }
+
+  let secrets;
+  try {
+    secrets = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(
+      `Wrangler returned an unexpected secret list response.\n${result.stdout.trim()}`,
+    );
+  }
+
+  if (!Array.isArray(secrets)) {
+    throw new Error("Wrangler returned an invalid Worker secret list.");
+  }
+
+  return new Set(secrets.map((secret) => secret?.name).filter(Boolean));
+}
+
+function deploymentDirectory(argumentsToDeploy) {
+  const { value: requestedDirectory } = removeSingleOption(
+    argumentsToDeploy,
+    "--cwd",
+  );
+  return requestedDirectory
+    ? resolve(invocationDirectory, requestedDirectory)
+    : invocationDirectory;
+}
+
+function parseJsonSecrets(content, filePath) {
+  let secrets;
+  try {
+    secrets = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  if (!secrets || typeof secrets !== "object" || Array.isArray(secrets)) {
+    throw new Error(
+      `Secrets file ${filePath} must contain a JSON object or dotenv values.`,
+    );
+  }
+
+  for (const [key, value] of Object.entries(secrets)) {
+    if (value !== null && typeof value !== "string") {
+      throw new Error(
+        `Secret ${key} in ${filePath} must be a string or null value.`,
+      );
+    }
+  }
+
+  return secrets;
+}
+
+function providedVapidKeys(secrets, filePath) {
+  const publicKey = secrets.VAPID_PUBLIC_KEY?.trim() ?? "";
+  const privateKey = secrets.VAPID_PRIVATE_KEY?.trim() ?? "";
+
+  if (Boolean(publicKey) !== Boolean(privateKey)) {
+    throw new Error(
+      `Secrets file ${filePath} must provide both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY, or neither.`,
+    );
+  }
+
+  if (!publicKey) return null;
+
+  return {
+    VAPID_PUBLIC_KEY: publicKey,
+    VAPID_PRIVATE_KEY: privateKey,
+  };
+}
+
+function generateVapidSecrets() {
+  const keys = generateVapidKeys();
+  return {
+    VAPID_PUBLIC_KEY: keys.publicKey,
+    VAPID_PRIVATE_KEY: keys.privateKey,
+  };
+}
+
+async function createInitialSecretsFile(temporaryDirectory, suppliedSecrets) {
+  if (!suppliedSecrets) {
+    const vapidKeys = generateVapidSecrets();
+    const secretsFile = join(temporaryDirectory, "secrets.json");
+    await writeFile(secretsFile, `${JSON.stringify(vapidKeys)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    return { secretsFile, generated: true };
+  }
+
+  const { content, parsedJson, vapidKeys: existingVapidKeys } = suppliedSecrets;
+  const vapidKeys = existingVapidKeys ?? generateVapidSecrets();
+  const secretsFile = join(
+    temporaryDirectory,
+    parsedJson ? "secrets.json" : "secrets.env",
+  );
+
+  if (parsedJson) {
+    await writeFile(
+      secretsFile,
+      `${JSON.stringify({ ...parsedJson, ...vapidKeys })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    return { secretsFile, generated: existingVapidKeys === null };
+  }
+
+  const vapidLines = existingVapidKeys
+    ? ""
+    : `VAPID_PUBLIC_KEY=${vapidKeys.VAPID_PUBLIC_KEY}\nVAPID_PRIVATE_KEY=${vapidKeys.VAPID_PRIVATE_KEY}\n`;
+  await writeFile(secretsFile, `${content.trimEnd()}\n${vapidLines}`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  return { secretsFile, generated: existingVapidKeys === null };
+}
+
+async function readSuppliedSecretsFile(sourceFile, effectiveDirectory) {
+  if (!sourceFile) return null;
+
+  const sourcePath = resolve(effectiveDirectory, sourceFile);
+  const content = await readFile(sourcePath, "utf8");
+  const parsedJson = parseJsonSecrets(content, sourceFile);
+  const secrets = parsedJson ?? parseEnv(content);
+
+  return {
+    content,
+    parsedJson,
+    values: secrets,
+    vapidKeys: providedVapidKeys(secrets, sourceFile),
+  };
+}
+
+export async function readDeploymentConfig(argumentsToDeploy) {
+  const { unstable_readConfig } = await import("wrangler");
+  const effectiveDirectory = deploymentDirectory(argumentsToDeploy);
+  const valueOf = (names) => {
+    const selected = optionArguments(argumentsToDeploy, names);
+    const last = selected.at(-1);
+    return last?.includes("=") ? last.slice(last.indexOf("=") + 1) : last;
+  };
+  const configFile = valueOf(["--config", "-c"]) ?? "wrangler.toml";
+  const config = unstable_readConfig(
+    {
+      config: resolve(effectiveDirectory, configFile),
+      env: valueOf(["--env", "-e"]),
+    },
+    { hideWarnings: true },
+  );
+  return { ...config, name: valueOf(["--name"]) ?? config.name };
+}
+
+export async function deploy(
+  argumentsToDeploy = deployArguments,
+  {
+    run = runWrangler,
+    environment = process.env,
+    readConfig = readDeploymentConfig,
+    fetchApi,
+    fetchPublic,
+  } = {},
+) {
+  if (booleanOptionEnabled(argumentsToDeploy, "--dry-run")) {
+    const result = await run(["deploy", ...argumentsToDeploy]);
+    return result.exitCode ?? 1;
+  }
+
+  await ensureRequiredQueues(queueContextArguments(argumentsToDeploy), run);
+
+  const { remaining: deployArgumentsWithoutSecretsFile, value: sourceFile } =
+    removeSingleOption(argumentsToDeploy, "--secrets-file");
+  const effectiveDirectory = deploymentDirectory(argumentsToDeploy);
+  const suppliedSecrets = await readSuppliedSecretsFile(
+    sourceFile,
+    effectiveDirectory,
+  );
+  const secrets = await existingSecretNames(
+    argumentsToDeploy,
+    run,
+    environment,
+  );
+  const hasPublicKey = secrets?.has("VAPID_PUBLIC_KEY") ?? false;
+  const hasPrivateKey = secrets?.has("VAPID_PRIVATE_KEY") ?? false;
+  const needsInitialKeys =
+    secrets === null || (!hasPublicKey && !hasPrivateKey);
+
+  if (hasPublicKey !== hasPrivateKey && !needsInitialKeys) {
+    throw new Error(
+      "Worker has only one VAPID secret configured. Refusing to rotate the existing key; restore both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY manually.",
+    );
+  }
+
+  let accessSetup = null;
+  if (
+    environment.WORKERS_CI === "1" &&
+    environment.ACCESS_AUTO_SETUP !== "false"
+  ) {
+    accessSetup = await prepareAccessSetup({
+      environment,
+      config: await readConfig(argumentsToDeploy),
+      existingSecrets: secrets,
+      suppliedSecrets: suppliedSecrets?.values,
+      fetchApi,
+      fetchPublic,
+    });
+  }
+
+  const temporaryDirectory =
+    needsInitialKeys || accessSetup
+      ? await mkdtemp(join(tmpdir(), "taiwan-fin-hub-deploy-"))
+      : null;
+
+  try {
+    let argumentsForUpload = argumentsToDeploy;
+    if (needsInitialKeys) {
+      const { secretsFile, generated } = await createInitialSecretsFile(
+        temporaryDirectory,
+        suppliedSecrets,
+      );
+      console.log(
+        generated
+          ? "[deploy] No VAPID key pair found; generating one for this Worker."
+          : "[deploy] Using the VAPID key pair from the supplied secrets file.",
+      );
+      argumentsForUpload = [
+        ...deployArgumentsWithoutSecretsFile,
+        "--secrets-file",
+        secretsFile,
+      ];
+    }
+
+    const result = await run(["deploy", ...argumentsForUpload]);
+    if (result.exitCode !== 0) return result.exitCode ?? 1;
+
+    if (accessSetup) {
+      const accessSecrets = await accessSetup.complete();
+      const secretsFile = join(temporaryDirectory, "access-secrets.json");
+      await writeFile(secretsFile, `${JSON.stringify(accessSecrets)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      // Upload a deployed version with the derived values. Wrangler preserves
+      // secrets not included here, including CONFIG_ENCRYPTION_KEY and VAPID.
+      const configured = await run([
+        "deploy",
+        ...deployArgumentsWithoutSecretsFile,
+        "--secrets-file",
+        secretsFile,
+      ]);
+      if (configured.exitCode !== 0) {
+        throw new Error(
+          "Worker Access is configured, but deploying its verification secrets failed. Retry the Cloudflare GUI deployment to finish setup.",
+        );
+      }
+      console.log(
+        "[deploy] TEAM_DOMAIN and POLICY_AUD configured automatically.",
+      );
+    }
+    return 0;
+  } finally {
+    if (temporaryDirectory)
+      await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === scriptPath) {
+  try {
+    process.exitCode = await deploy();
+  } catch (error) {
+    console.error(`[deploy] ${error.message}`);
+    process.exitCode = 1;
+  }
+}

@@ -1,0 +1,46 @@
+name: Sync Latest Version
+
+on:
+  schedule:
+    # GitHub Actions 使用 UTC；台灣時間每天 04:15 執行。
+    - cron: "15 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # 官方 repository 不需要同步自己；Deploy to Cloudflare 建立的副本才會執行。
+    if: github.repository != 'TedLin1993/taiwan-fin-hub' && github.repository != 'TedLin1993/all-set-tw'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout deployed repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync upstream main safely
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "taiwan-fin-hub-updater"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          updater="scripts/sync-upstream.mjs"
+          if [ ! -f "$updater" ]; then
+            # 舊版 Cloudflare 部署 repo 尚未包含 updater script；只下載至 runner 暫存目錄。
+            updater="$RUNNER_TEMP/sync-upstream.mjs"
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/TedLin1993/all-set-tw/main/scripts/sync-upstream.mjs" \
+              --output "$updater"
+          fi
+
+          node "$updater"

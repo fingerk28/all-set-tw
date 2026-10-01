@@ -1,0 +1,11 @@
+CONFIG_ENCRYPTION_KEY=replace-with-at-least-32-random-characters
+TEAM_DOMAIN=https://placeholder.invalid
+POLICY_AUD=temporary-placeholder
+# Only bypass Cloudflare Access for localhost/127.0.0.1 during development.
+LOCAL_DEV_MODE=true
+# Production deploys generate and persist the VAPID key pair automatically.
+# For local push testing, uncomment and provide a matching key pair.
+# VAPID_PUBLIC_KEY=replace-with-web-push-public-key
+# VAPID_PRIVATE_KEY=replace-with-web-push-private-key
+# Optional; defaults to mailto:admin@example.com
+# VAPID_SUBJECT=mailto:admin@example.com
